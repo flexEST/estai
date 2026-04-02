@@ -33,7 +33,7 @@ export default async function handler(req, res) {
   try {
     const completion = await openai.chat.completions.create({
       model: "gpt-4o-mini",      // cheap & fast
-      max_tokens: 300,            // limit cost
+      max_tokens: 1000,            // limit cost
       temperature: 0.7,           // creativity
       messages: [
         { role: "system", content: system || "You are a helpful assistant." },
