@@ -43,7 +43,7 @@ export default async function handler(req, res) {
 
     // Generate content using Google's new GenAI client syntax
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash", // Fast, low-cost flagship model
+      model: "gemini-2.5-flash-lite", // <-- Changed to Lite to access the 1,000 RPD free tier
       contents: formattedContents,
       config: {
         maxOutputTokens: 1000,   // Limits response size/cost
