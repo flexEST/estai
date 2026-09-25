@@ -42,7 +42,7 @@ const MAX_SYSTEM_PROMPT_LEN = 20000;
 
 // Daily per-user message cap. This used to live in ai.html (MAX_DAILY_MESSAGES = 5,
 // checked and enforced client-side). It's enforced here now instead, and raised to 10.
-const MAX_DAILY_MESSAGES = 10;
+const MAX_DAILY_MESSAGES = 2;
 
 // Fixed timezone for the "daily" boundary, in minutes to ADD to UTC (Azerbaijan
 // is UTC+4 year-round — AZT has not observed DST since 2016, so this never needs
