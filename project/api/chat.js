@@ -1,32 +1,30 @@
 // code.js
 import { GoogleGenAI } from "@google/genai";
+import { createClient } from "@supabase/supabase-js";
 
 const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY
 });
 
+// ===== SUPABASE (server-side) =====
+const SUPABASE_URL = process.env.SUPABASE_URL || "https://gtxysgqfuepywqwyciii.supabase.co";
+const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY; // ← service role key (RLS bypass)
+const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
+  auth: { persistSession: false, autoRefreshToken: false }
+});
+
 // ===== LIMITS =====
-// Vercel Serverless Functions enforce a hard 4.5 MB request-body limit that cannot
-// be raised — it's a fixed platform limit, not something bodyParser config can change
-// (confirmed on Vercel's own "how to bypass the 4.5MB body size limit" article).
-// Base64 inflates a file by ~33%, and the JSON envelope (chat history + system prompt)
-// adds a bit more on top — so the raw file has to stay well under 4.5 MB for the
-// encoded request to actually arrive. Keep this formula identical to the one in
-// ai.html (client side), or a file that passes there could still get rejected here.
+const MAX_DAILY_MESSAGES = 5;
+
 const VERCEL_BODY_LIMIT_BYTES = 4.5 * 1024 * 1024;
 const JSON_OVERHEAD_BYTES = 200 * 1024;
 const MAX_ATTACHMENT_BYTES = Math.floor(((VERCEL_BODY_LIMIT_BYTES - JSON_OVERHEAD_BYTES) * 3) / 4);
 
-const MAX_TEXT_LENGTH = 200;                        // matches the client's per-message char limit
-const MAX_MESSAGE_STORE_LEN = MAX_TEXT_LENGTH * 4;  // small buffer for older turns
+const MAX_TEXT_LENGTH = 200;
+const MAX_MESSAGE_STORE_LEN = MAX_TEXT_LENGTH * 4;
 const MAX_HISTORY_MESSAGES = 30;
 const MAX_SYSTEM_PROMPT_LEN = 20000;
 
-// This is the only set of mimeTypes the client will ever actually send: images go
-// through as-is, and every audio attachment (recorded or picked) is re-encoded to
-// audio/wav in the browser before upload, because Gemini's officially supported
-// audio types are wav/mp3/aiff/aac/ogg/flac — not the webm/mp4 a MediaRecorder
-// produces. Keeping the allow-list this tight also shrinks the attack surface.
 const ALLOWED_MIME_TYPES = new Set([
   "image/jpeg", "image/png", "image/webp",
   "application/pdf",
@@ -34,8 +32,6 @@ const ALLOWED_MIME_TYPES = new Set([
   "audio/wav"
 ]);
 
-// Magic-byte signatures so a file can't be smuggled through by relabeling its
-// declared mimeType. text/plain has no reliable signature; size + allow-list still apply to it.
 const MAGIC_BYTES = {
   "image/png": [0x89, 0x50, 0x4e, 0x47],
   "image/jpeg": [0xff, 0xd8, 0xff],
@@ -72,7 +68,6 @@ function validateAttachment(attachment) {
     return { ok: false, status: 400, error: "malformed file data" };
   }
 
-  // Cheap length-based check before touching the buffer, then confirm on the real bytes.
   const approxBytes = Math.floor((data.length * 3) / 4);
   if (approxBytes > MAX_ATTACHMENT_BYTES) {
     return { ok: false, status: 413, error: "file too large" };
@@ -91,18 +86,79 @@ function validateAttachment(attachment) {
 }
 
 // ===== CORS =====
-// Optional origin allow-list. Set ALLOWED_ORIGINS in the Vercel dashboard
-// (Project -> Settings -> Environment Variables) as a comma-separated list,
-// e.g. https://flexest.github.io — no code changes or CLI needed.
-// Leaving it unset keeps today's open behaviour so nothing breaks.
 function isAllowedOrigin(origin) {
-  if (!origin) return true; // non-browser callers (curl, server-to-server) send no Origin header
+  if (!origin) return true;
   const allowed = (process.env.ALLOWED_ORIGINS || "")
     .split(",")
     .map(s => s.trim())
     .filter(Boolean);
   if (allowed.length === 0) return true;
   return allowed.indexOf(origin) !== -1;
+}
+
+// ===== AUTH + LIMIT HELPERS =====
+async function getUserIdFromRequest(req) {
+  const authHeader = req.headers.authorization || "";
+  const token = authHeader.replace(/^Bearer\s+/i, "").trim();
+  if (!token) return null;
+  try {
+    const { data, error } = await supabaseAdmin.auth.getUser(token);
+    if (error || !data || !data.user) return null;
+    return data.user.id;
+  } catch (e) {
+    return null;
+  }
+}
+
+function getClientIp(req) {
+  const fwd = req.headers["x-forwarded-for"];
+  if (fwd) return String(fwd).split(",")[0].trim();
+  return req.socket?.remoteAddress || "unknown";
+}
+
+// Returns local midnight in ISO with the client's timezone offset.
+// Client sends its offset (minutes) so the daily counter resets at the user's local midnight.
+function getLocalMidnightISO(tzOffsetMinutes) {
+  const now = new Date();
+  const offset = Number.isFinite(tzOffsetMinutes) ? tzOffsetMinutes : 0;
+  const local = new Date(now.getTime() + offset * 60 * 1000);
+  const y = local.getUTCFullYear();
+  const m = String(local.getUTCMonth() + 1).padStart(2, "0");
+  const d = String(local.getUTCDate()).padStart(2, "0");
+  const sign = offset >= 0 ? "+" : "-";
+  const abs = Math.abs(offset);
+  const oh = String(Math.floor(abs / 60)).padStart(2, "0");
+  const om = String(abs % 60).padStart(2, "0");
+  return `${y}-${m}-${d}T00:00:00${sign}${oh}:${om}`;
+}
+
+// Count today's messages for a user, then insert a new row (only if under limit).
+async function checkAndRecordMessage(userId, tzOffsetMinutes) {
+  const since = getLocalMidnightISO(tzOffsetMinutes);
+
+  // 1. count today's rows
+  const { count, error: countErr } = await supabaseAdmin
+    .from("chat_messages")
+    .select("*", { count: "exact", head: true })
+    .eq("user_id", userId)
+    .gte("created_at", since);
+
+  if (countErr) throw new Error("limit check failed");
+
+  const used = count || 0;
+  if (used >= MAX_DAILY_MESSAGES) {
+    return { allowed: false, used, remaining: 0 };
+  }
+
+  // 2. insert a new row (message_text stays as the short placeholder)
+  const messageId = "msg_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7);
+  const { error: insertErr } = await supabaseAdmin
+    .from("chat_messages")
+    .insert([{ id: messageId, user_id: userId, message_text: "message_sent" }]);
+
+  if (insertErr) throw new Error("record failed");
+
+  return { allowed: true, used: used + 1, remaining: MAX_DAILY_MESSAGES - (used + 1) };
 }
 
 export default async function handler(req, res) {
@@ -114,27 +170,31 @@ export default async function handler(req, res) {
   }
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
-  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("X-Content-Type-Options", "nosniff");
 
   if (req.method === "OPTIONS") {
     return res.status(200).end();
   }
-
   if (req.method !== "POST") {
     return res.status(405).json({ error: "Method not allowed" });
   }
-
   if (!originOk) {
     return res.status(403).json({ error: "Origin not allowed" });
   }
-
   if (!process.env.GEMINI_API_KEY) {
     return res.status(500).json({ error: "Missing Gemini API key" });
   }
 
-  const { messages, system, stream, attachment } = req.body || {};
+  const { messages, system, stream, attachment, tzOffsetMinutes } = req.body || {};
 
+  // ---- 1. AUTH: user_id from Supabase JWT, else IP-based key ----
+  let userId = await getUserIdFromRequest(req);
+  if (!userId) {
+    userId = "ip_" + getClientIp(req); // fallback: IP-based bucket
+  }
+
+  // ---- 2. VALIDATE BODY ----
   if (!messages || !Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({ error: "messages array required" });
   }
@@ -162,14 +222,35 @@ export default async function handler(req, res) {
     validatedAttachment = result;
   }
 
+  // ---- 3. DAILY LIMIT (server-side) ----
+  let limitInfo;
+  try {
+    limitInfo = await checkAndRecordMessage(userId, tzOffsetMinutes);
+  } catch (e) {
+    console.error("limit error:", e.message);
+    return res.status(500).json({ error: "limit check failed" });
+  }
+
+  if (!limitInfo.allowed) {
+    return res.status(429).json({
+      error: "daily_limit_reached",
+      used: limitInfo.used,
+      remaining: 0,
+      max: MAX_DAILY_MESSAGES
+    });
+  }
+
+  // Tell client how many are left
+  res.setHeader("X-Daily-Limit-Remaining", String(limitInfo.remaining));
+  res.setHeader("X-Daily-Limit-Max", String(MAX_DAILY_MESSAGES));
+
+  // ---- 4. GEMINI CALL ----
   try {
     const formattedContents = messages.map(msg => ({
       role: msg.role === "assistant" ? "model" : "user",
       parts: [{ text: msg.content }]
     }));
 
-    // Attach the (already-validated) file to the last user turn only — that's the
-    // one the person just sent; older turns in history never carried a real file.
     if (validatedAttachment) {
       const lastPart = formattedContents[formattedContents.length - 1];
       if (lastPart && lastPart.role === "user") {
@@ -188,7 +269,6 @@ export default async function handler(req, res) {
       systemInstruction: system || "You are a helpful assistant."
     };
 
-    // If client requested a stream, use generateContentStream
     if (stream) {
       res.setHeader("Content-Type", "text/plain; charset=utf-8");
       res.setHeader("Transfer-Encoding", "chunked");
@@ -200,14 +280,11 @@ export default async function handler(req, res) {
       });
 
       for await (const chunk of responseStream) {
-        if (chunk.text) {
-          res.write(chunk.text);
-        }
+        if (chunk.text) res.write(chunk.text);
       }
       return res.end();
     }
 
-    // Fallback standard JSON response if stream is not requested
     const response = await ai.models.generateContent({
       model: "gemini-2.5-flash-lite",
       contents: formattedContents,
@@ -217,7 +294,6 @@ export default async function handler(req, res) {
     return res.status(200).json({ content: response.text });
 
   } catch (err) {
-    // Never log request bodies or attachment bytes — only a short message.
     console.error("Gemini API error:", err && err.message ? err.message : err);
     if (!res.headersSent) {
       res.status(500).json({ error: "⚠️ AI error, try again later" });
