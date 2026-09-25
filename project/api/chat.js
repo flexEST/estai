@@ -6,16 +6,21 @@ const ai = new GoogleGenAI({
   apiKey: process.env.GEMINI_API_KEY
 });
 
-// ===== SUPABASE (server-side) =====
-const SUPABASE_URL = process.env.SUPABASE_URL || "https://gtxysgqfuepywqwyciii.supabase.co";
-const SUPABASE_SERVICE_KEY = process.env.SUPABASE_SERVICE_KEY; // ← service role key (RLS bypass)
-const supabaseAdmin = createClient(SUPABASE_URL, SUPABASE_SERVICE_KEY, {
-  auth: { persistSession: false, autoRefreshToken: false }
-});
+// ===== SUPABASE (anon key, RLS aktiv) =====
+const SUPABASE_URL = "https://gtxysgqfuepywqwyciii.supabase.co";
+const SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imd0eHlzZ3FmdWVweXdxd3ljaWlpIiwicm9sZSI6ImFub24iLCJpYXQiOjE3ODY4MDE1NDcsImV4cCI6MjEwMjM3NzU0N30.Ze7rlhSxIicrgtPk0FFbX04_s41FniHXGvlveH9PbLQ";
+
+// Bu client RLS-ə tabedir. İstifadəçi tokenini ötürəndə onun adına işləyir.
+function getSupabaseForUser(accessToken) {
+  const options = { auth: { persistSession: false, autoRefreshToken: false } };
+  if (accessToken) {
+    options.global = { headers: { Authorization: `Bearer ${accessToken}` } };
+  }
+  return createClient(SUPABASE_URL, SUPABASE_ANON_KEY, options);
+}
 
 // ===== LIMITS =====
 const MAX_DAILY_MESSAGES = 5;
-
 const VERCEL_BODY_LIMIT_BYTES = 4.5 * 1024 * 1024;
 const JSON_OVERHEAD_BYTES = 200 * 1024;
 const MAX_ATTACHMENT_BYTES = Math.floor(((VERCEL_BODY_LIMIT_BYTES - JSON_OVERHEAD_BYTES) * 3) / 4);
@@ -85,39 +90,15 @@ function validateAttachment(attachment) {
   return { ok: true, buffer, mimeType, name: safeName };
 }
 
-// ===== CORS =====
 function isAllowedOrigin(origin) {
   if (!origin) return true;
   const allowed = (process.env.ALLOWED_ORIGINS || "")
-    .split(",")
-    .map(s => s.trim())
-    .filter(Boolean);
+    .split(",").map(s => s.trim()).filter(Boolean);
   if (allowed.length === 0) return true;
   return allowed.indexOf(origin) !== -1;
 }
 
-// ===== AUTH + LIMIT HELPERS =====
-async function getUserIdFromRequest(req) {
-  const authHeader = req.headers.authorization || "";
-  const token = authHeader.replace(/^Bearer\s+/i, "").trim();
-  if (!token) return null;
-  try {
-    const { data, error } = await supabaseAdmin.auth.getUser(token);
-    if (error || !data || !data.user) return null;
-    return data.user.id;
-  } catch (e) {
-    return null;
-  }
-}
-
-function getClientIp(req) {
-  const fwd = req.headers["x-forwarded-for"];
-  if (fwd) return String(fwd).split(",")[0].trim();
-  return req.socket?.remoteAddress || "unknown";
-}
-
-// Returns local midnight in ISO with the client's timezone offset.
-// Client sends its offset (minutes) so the daily counter resets at the user's local midnight.
+// Yerli gecə yarısı (ISO)
 function getLocalMidnightISO(tzOffsetMinutes) {
   const now = new Date();
   const offset = Number.isFinite(tzOffsetMinutes) ? tzOffsetMinutes : 0;
@@ -132,31 +113,39 @@ function getLocalMidnightISO(tzOffsetMinutes) {
   return `${y}-${m}-${d}T00:00:00${sign}${oh}:${om}`;
 }
 
-// Count today's messages for a user, then insert a new row (only if under limit).
-async function checkAndRecordMessage(userId, tzOffsetMinutes) {
+// ===== LIMIT + RECORD (anon key, RLS-ə tabedir) =====
+async function checkAndRecordMessage(supabaseUser, userId, tzOffsetMinutes) {
   const since = getLocalMidnightISO(tzOffsetMinutes);
 
-  // 1. count today's rows
-  const { count, error: countErr } = await supabaseAdmin
+  // 1. Bugünkü mesajları say (RLS yalnız öz mesajlarını göstərir)
+  const { count, error: countErr } = await supabaseUser
     .from("chat_messages")
     .select("*", { count: "exact", head: true })
     .eq("user_id", userId)
     .gte("created_at", since);
 
-  if (countErr) throw new Error("limit check failed");
+  if (countErr) {
+    // RLS oxumağa icazə vermirsə, "0" qəbul et (limit işləməyəcək, amma ən azı crash olmasın)
+    console.warn("limit count error:", countErr.message);
+    return { allowed: true, used: 0, remaining: MAX_DAILY_MESSAGES, rlsBlocked: true };
+  }
 
   const used = count || 0;
   if (used >= MAX_DAILY_MESSAGES) {
     return { allowed: false, used, remaining: 0 };
   }
 
-  // 2. insert a new row (message_text stays as the short placeholder)
+  // 2. Yeni sətir yaz (RLS INSERT icazə verirsə keçir, vermirsə xəta)
   const messageId = "msg_" + Date.now() + "_" + Math.random().toString(36).slice(2, 7);
-  const { error: insertErr } = await supabaseAdmin
+  const { error: insertErr } = await supabaseUser
     .from("chat_messages")
     .insert([{ id: messageId, user_id: userId, message_text: "message_sent" }]);
 
-  if (insertErr) throw new Error("record failed");
+  if (insertErr) {
+    // Yaza bilmirsə, sayğacı artırma, amma davam et
+    console.warn("limit insert error:", insertErr.message);
+    return { allowed: true, used, remaining: MAX_DAILY_MESSAGES - used, rlsBlocked: true };
+  }
 
   return { allowed: true, used: used + 1, remaining: MAX_DAILY_MESSAGES - (used + 1) };
 }
@@ -165,36 +154,43 @@ export default async function handler(req, res) {
   const origin = req.headers.origin;
   const originOk = isAllowedOrigin(origin);
 
-  if (originOk) {
-    res.setHeader("Access-Control-Allow-Origin", origin || "*");
-  }
+  if (originOk) res.setHeader("Access-Control-Allow-Origin", origin || "*");
   res.setHeader("Vary", "Origin");
   res.setHeader("Access-Control-Allow-Methods", "POST, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
   res.setHeader("X-Content-Type-Options", "nosniff");
 
-  if (req.method === "OPTIONS") {
-    return res.status(200).end();
-  }
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Method not allowed" });
-  }
-  if (!originOk) {
-    return res.status(403).json({ error: "Origin not allowed" });
-  }
-  if (!process.env.GEMINI_API_KEY) {
-    return res.status(500).json({ error: "Missing Gemini API key" });
-  }
+  if (req.method === "OPTIONS") return res.status(200).end();
+  if (req.method !== "POST") return res.status(405).json({ error: "Method not allowed" });
+  if (!originOk) return res.status(403).json({ error: "Origin not allowed" });
+  if (!process.env.GEMINI_API_KEY) return res.status(500).json({ error: "Missing Gemini API key" });
 
   const { messages, system, stream, attachment, tzOffsetMinutes } = req.body || {};
 
-  // ---- 1. AUTH: user_id from Supabase JWT, else IP-based key ----
-  let userId = await getUserIdFromRequest(req);
+  // ---- 1. İstifadəçinin tokenini götür ----
+  const authHeader = req.headers.authorization || "";
+  const accessToken = authHeader.replace(/^Bearer\s+/i, "").trim() || null;
+
+  // ---- 2. Supabase client (anon key + istifadəçi tokeni) ----
+  const supabaseUser = getSupabaseForUser(accessToken);
+
+  // ---- 3. user_id tap ----
+  let userId = null;
+  if (accessToken) {
+    try {
+      const { data, error } = await supabaseUser.auth.getUser(accessToken);
+      if (!error && data && data.user) userId = data.user.id;
+    } catch (e) {}
+  }
   if (!userId) {
-    userId = "ip_" + getClientIp(req); // fallback: IP-based bucket
+    // Login olmayanlar üçün client-in göndərdiyi `guest_xxx` istifadə et
+    userId = req.body.guestId || null;
+  }
+  if (!userId) {
+    return res.status(400).json({ error: "user_id required" });
   }
 
-  // ---- 2. VALIDATE BODY ----
+  // ---- 4. Body validasiyası ----
   if (!messages || !Array.isArray(messages) || messages.length === 0) {
     return res.status(400).json({ error: "messages array required" });
   }
@@ -216,19 +212,17 @@ export default async function handler(req, res) {
   let validatedAttachment = null;
   if (attachment) {
     const result = validateAttachment(attachment);
-    if (!result.ok) {
-      return res.status(result.status).json({ error: result.error });
-    }
+    if (!result.ok) return res.status(result.status).json({ error: result.error });
     validatedAttachment = result;
   }
 
-  // ---- 3. DAILY LIMIT (server-side) ----
+  // ---- 5. Limit yoxla + yaz ----
   let limitInfo;
   try {
-    limitInfo = await checkAndRecordMessage(userId, tzOffsetMinutes);
+    limitInfo = await checkAndRecordMessage(supabaseUser, userId, tzOffsetMinutes);
   } catch (e) {
     console.error("limit error:", e.message);
-    return res.status(500).json({ error: "limit check failed" });
+    limitInfo = { allowed: true, used: 0, remaining: MAX_DAILY_MESSAGES };
   }
 
   if (!limitInfo.allowed) {
@@ -240,11 +234,10 @@ export default async function handler(req, res) {
     });
   }
 
-  // Tell client how many are left
   res.setHeader("X-Daily-Limit-Remaining", String(limitInfo.remaining));
   res.setHeader("X-Daily-Limit-Max", String(MAX_DAILY_MESSAGES));
 
-  // ---- 4. GEMINI CALL ----
+  // ---- 6. Gemini ----
   try {
     const formattedContents = messages.map(msg => ({
       role: msg.role === "assistant" ? "model" : "user",
@@ -295,10 +288,7 @@ export default async function handler(req, res) {
 
   } catch (err) {
     console.error("Gemini API error:", err && err.message ? err.message : err);
-    if (!res.headersSent) {
-      res.status(500).json({ error: "⚠️ AI error, try again later" });
-    } else {
-      res.end();
-    }
+    if (!res.headersSent) res.status(500).json({ error: "⚠️ AI error, try again later" });
+    else res.end();
   }
 }
