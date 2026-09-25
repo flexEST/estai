@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "type": "module",
   "dependencies": {
-    "@google/genai": "latest"
+    "@google/genai": "latest",
+    "@supabase/supabase-js": "^2.x.x"
   }
 }
