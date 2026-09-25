@@ -1,4 +1,3 @@
-// code.js
 import { GoogleGenAI } from "@google/genai";
 import { createClient } from "@supabase/supabase-js";
 
@@ -36,7 +35,7 @@ const VERCEL_BODY_LIMIT_BYTES = 4.5 * 1024 * 1024;
 const JSON_OVERHEAD_BYTES = 200 * 1024;
 const MAX_ATTACHMENT_BYTES = Math.floor(((VERCEL_BODY_LIMIT_BYTES - JSON_OVERHEAD_BYTES) * 3) / 4);
 
-const MAX_TEXT_LENGTH = 200;                        // matches the client's per-message char limit
+const MAX_TEXT_LENGTH = 200;                    // matches the client's per-message char limit
 const MAX_MESSAGE_STORE_LEN = MAX_TEXT_LENGTH * 4;  // small buffer for older turns
 const MAX_HISTORY_MESSAGES = 30;
 const MAX_SYSTEM_PROMPT_LEN = 20000;
@@ -337,7 +336,7 @@ export default async function handler(req, res) {
       res.setHeader("Transfer-Encoding", "chunked");
 
       const responseStream = await ai.models.generateContentStream({
-        model: "gemini-2.5-flash-lite",
+        model: "gemini-3.5-flash-lite", // Updated model
         contents: formattedContents,
         config: config
       });
@@ -352,7 +351,7 @@ export default async function handler(req, res) {
 
     // Fallback standard JSON response if stream is not requested
     const response = await ai.models.generateContent({
-      model: "gemini-2.5-flash-lite",
+      model: "gemini-3.5-flash-lite", // Updated model
       contents: formattedContents,
       config: config
     });
